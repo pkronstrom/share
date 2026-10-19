@@ -1,1 +1,11 @@
-{}
+{
+  "foxyasset": {
+    "name": "foxyasset",
+    "title": "Foxy Asset",
+    "url": "https://pkronstrom.github.io/share/cards/foxyasset/",
+    "sha256": "7e9e9e10d1e0e0c5fcb3cef9b9e66b169dd9c894dc56b39e84a08f35645d40e1",
+    "file": "index.html",
+    "preview_url": "https://pkronstrom.github.io/share/cards/foxyasset/preview.png",
+    "preview_sha256": "e4d717910f3bfd54f8ced4491aa8b1468e3a875e11ffca6a932b859b08040829"
+  }
+}
