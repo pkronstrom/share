@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Publish files to the share GitHub Pages repository. Python 3, git and gh."""
+import argparse
+import hashlib
+import html
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import quote, urlsplit
+
+ROOT = Path(os.environ.get('QUICK_SHARE_REPO', Path(__file__).resolve().parent)).resolve()
+BASE = 'https://pkronstrom.github.io/share'
+REPOSITORY = 'pkronstrom/share'
+
+
+def git(*args):
+    result = subprocess.run(['git', '-C', str(ROOT), *args], text=True, capture_output=True)
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or 'Git command failed')
+    return result.stdout.strip()
+
+
+def slug(value):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', value):
+        raise ValueError('Name must be 1–64 lowercase letters, digits or hyphens, starting with a letter/digit')
+    return value
+
+
+def load():
+    path = ROOT / 'cards/catalog.json'
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def write_catalog(catalog):
+    (ROOT / 'cards').mkdir(exist_ok=True)
+    (ROOT / 'cards/catalog.json').write_text(json.dumps(catalog, indent=2, ensure_ascii=False) + '\n')
+    links = []
+    for key, entry in sorted(catalog.items()):
+        image = '<img src="' + html.escape(entry['preview_url'], quote=True) + '" alt="">' if entry.get('preview_url') else ''
+        links.append('<a href="' + html.escape(entry['url'], quote=True) + '">' + image + '<span>' + html.escape(entry['title']) + '</span></a>')
+    page = '''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared cards</title><style>
+    body{margin:0;background:#151e18;color:#e6dfc9;font:16px system-ui;padding:40px}main{display:flex;flex-wrap:wrap;gap:28px;max-width:1100px;margin:auto}a{color:inherit;text-decoration:none;display:grid;gap:12px;width:min(100%,330px)}img{width:100%;border-radius:12px}span{padding:5px 0}a:focus-visible{outline:2px solid #e0cc94;outline-offset:8px}
+    </style><main>''' + ''.join(links) + '</main></html>\n'
+    (ROOT / 'index.html').write_text(page)
+
+
+def finish(args, result, paths=(), message=''):
+    if args.dry_run:
+        return {**result, 'status': 'dry_run'}
+    if paths:
+        git('add', '--', *paths)
+        git('commit', '-m', message)
+    if not args.no_push:
+        git('push', 'origin', 'HEAD:main')
+        # Completion is checked against this exact commit, not an older Pages build.
+        commit = git('rev-parse', 'HEAD')
+        until = time.monotonic() + 240
+        while time.monotonic() < until:
+            build = subprocess.run(['gh', 'api', f'repos/{REPOSITORY}/pages/builds/latest'], capture_output=True, text=True)
+            if build.returncode == 0:
+                data = json.loads(build.stdout)
+                if data.get('commit') == commit:
+                    if data.get('status') == 'built':
+                        result['deployment'] = 'built'
+                        break
+                    if data.get('status') == 'errored':
+                        raise ValueError('Git push succeeded, but Pages build failed. Inspect: gh run list --repo ' + REPOSITORY)
+            time.sleep(3)
+        else:
+            result['deployment'] = 'pending; inspect gh run list --repo ' + REPOSITORY
+    return result
+
+
+def publish(args):
+    source = args.file.expanduser()
+    if source.is_symlink() or not source.is_file():
+        raise ValueError('Choose an explicit regular file: quick-share publish FILE --name NAME')
+    data = source.read_bytes()
+    if len(data) > 25 * 1024 * 1024:
+        raise ValueError('This simple sharing CLI accepts files up to 25 MiB')
+    name = slug(args.name or re.sub(r'[^a-z0-9]+', '-', source.stem.lower()).strip('-'))
+    catalog = load()
+    destination = ROOT / 'cards' / name
+    if destination.is_symlink():
+        raise ValueError('Refusing symlink destination')
+    is_html = source.suffix.lower() in ('.html', '.htm')
+    filename = 'index.html' if is_html else source.name
+    url = BASE + '/cards/' + name + '/' + ('' if is_html else quote(filename))
+    entry = {'name': name, 'title': source.stem, 'url': url, 'sha256': hashlib.sha256(data).hexdigest(), 'file': filename}
+    preview = None
+    if args.preview:
+        if args.preview.suffix.lower() not in ('.png', '.jpg', '.jpeg', '.webp') or not args.preview.is_file():
+            raise ValueError('Preview must be a PNG/JPEG/WebP image file')
+        preview = args.preview.read_bytes()
+        if len(preview) > 10 * 1024 * 1024:
+            raise ValueError('Preview image exceeds 10 MiB')
+        preview_name = 'preview' + args.preview.suffix.lower()
+        entry.update(preview_url=BASE + '/cards/' + name + '/' + preview_name, preview_sha256=hashlib.sha256(preview).hexdigest())
+    if is_html:
+        text = data.decode('utf-8')
+        match = re.search(r'<script\b[^>]*id="share-manifest"[^>]*>(.*?)</script>', text, re.S | re.I)
+        description = 'An original collectible card containing its own assets.'
+        if match:
+            manifest = json.loads(match[1])
+            entry['title'] = str(manifest.get('title', source.stem))
+            description = str(manifest.get('description', description))
+        meta = {'og:type': 'website', 'og:title': entry['title'], 'og:description': description, 'og:url': url}
+        if preview:
+            meta['og:image'] = entry['preview_url']
+        tags = '\n'.join('<meta property="' + key + '" content="' + html.escape(value, quote=True) + '">' for key, value in meta.items())
+        if preview:
+            tags += '\n<meta name="twitter:card" content="summary_large_image">'
+        text = re.sub(r'</head\s*>', lambda _: tags + '\n</head>', text, count=1, flags=re.I)
+        data = text.encode('utf-8')
+    if catalog.get(name) == entry:
+        return finish(args, {**entry, 'status': 'unchanged'})
+    if name in catalog and not args.replace:
+        raise ValueError('Share exists. Update deliberately with: quick-share publish FILE --name ' + name + ' --replace')
+    if destination.exists() and name not in catalog:
+        raise ValueError('Unmanaged destination exists; refusing to overwrite it')
+    result = {**entry, 'status': 'published'}
+    if args.dry_run:
+        return finish(args, result)
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    (destination / filename).write_bytes(data)
+    if preview:
+        (destination / preview_name).write_bytes(preview)
+    catalog[name] = entry
+    write_catalog(catalog)
+    return finish(args, result, ['cards/' + name, 'cards/catalog.json', 'index.html'], 'Publish ' + name)
+
+
+def unshare(args):
+    name = args.name
+    if name.startswith('https://'):
+        parsed = urlsplit(name)
+        if parsed.netloc != 'pkronstrom.github.io' or not parsed.path.startswith('/share/cards/'):
+            raise ValueError('URL does not belong to this sharing site')
+        name = parsed.path[len('/share/cards/'):].split('/')[0]
+    name = slug(name)
+    catalog = load()
+    if name not in catalog:
+        return finish(args, {'name': name, 'status': 'already_absent'})
+    result = {'name': name, 'url': catalog[name]['url'], 'status': 'unshared', 'note': 'Removed from the live site; Git history and downloaded copies remain.'}
+    if args.dry_run:
+        return finish(args, result)
+    destination = ROOT / 'cards' / name
+    if destination.is_symlink():
+        raise ValueError('Refusing symlink destination')
+    if destination.exists():
+        shutil.rmtree(destination)
+    del catalog[name]
+    write_catalog(catalog)
+    return finish(args, result, ['cards/' + name, 'cards/catalog.json', 'index.html'], 'Unshare ' + name)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Example: quick-share publish ./card.html --name foxyasset --preview ./preview.png')
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('publish', help='Publish a file and print its live URL')
+    p.add_argument('file', type=Path)
+    p.add_argument('--name', help='URL name, e.g. foxyasset')
+    p.add_argument('--preview', type=Path, help='Image for link previews in chat apps')
+    p.add_argument('--replace', action='store_true', help='Replace an existing share')
+    p = sub.add_parser('unshare', help='Remove a share from the live site; Git history remains')
+    p.add_argument('name', help='Share name or published URL')
+    sub.add_parser('list', help='List shares and their URLs as JSON')
+    for name in ('publish', 'unshare'):
+        sub.choices[name].add_argument('--dry-run', action='store_true', help='Show the action without changing files or GitHub')
+        sub.choices[name].add_argument('--no-push', action='store_true', help='Commit locally without pushing; useful for previews/tests')
+    args = parser.parse_args()
+    try:
+        if args.command == 'list':
+            result = {'shares': list(load().values())}
+        else:
+            if git('status', '--porcelain', '--untracked-files=all'):
+                raise ValueError('Sharing repository has local edits. Commit or resolve your own changes first; nothing was changed.')
+            result = publish(args) if args.command == 'publish' else unshare(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        parser.exit(1, 'quick-share: ' + str(exc) + '\n')
+
+
+if __name__ == '__main__':
+    main()
